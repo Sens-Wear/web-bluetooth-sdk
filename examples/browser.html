@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SensWear Web Bluetooth demo</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    body { max-width: 760px; margin: 3rem auto; padding: 0 1.25rem; line-height: 1.6; }
+    button, input { font: inherit; margin: .3rem; padding: .45rem .8rem; }
+    button:disabled { opacity: .45; }
+    .controls { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem; }
+    #output { white-space: pre-wrap; overflow-wrap: anywhere; padding: 1rem; background: #7772; border-radius: .5rem; }
+    #status { min-height: 1.6em; }
+  </style>
+</head>
+<body>
+  <h1>SensWear Web Bluetooth</h1>
+  <p>Connect to your SensWear device to read its firmware, watch sensor data, and control outputs.</p>
+  <div class="controls">
+    <button id="connect">Connect</button>
+    <button id="disconnect" disabled>Disconnect</button>
+    <button id="read" disabled>Read battery</button>
+  </div>
+  <div class="controls">
+    <label for="color">LED color</label>
+    <input id="color" type="color" value="#20a0ff" disabled>
+    <button id="led" disabled>Set LED</button>
+    <button id="haptic" disabled>Vibrate</button>
+    <button id="imu" disabled>Start IMU stream</button>
+  </div>
+  <p id="status" role="status">Loading SDK…</p>
+  <pre id="output" aria-label="Device data">No device connected.</pre>
+  <p>Serve this directory on localhost or HTTPS. Bluetooth support depends on the browser and operating system.</p>
+  <script type="module">
+    import { DeviceFeature, IMU_ACCELEROMETER_UUID, SenswearClient } from "../dist/index.js";
+
+    const $ = (id) => document.getElementById(id);
+    const state = {};
+    let client = null;
+    let capabilities = null;
+    let streaming = false;
+    let samples = 0;
+    let lastRender = 0;
+
+    function render() {
+      $("output").textContent = JSON.stringify(state, (_, value) => typeof value === "bigint" ? value.toString() : value, 2);
+    }
+    function controls(connected) {
+      $("connect").disabled = connected || !SenswearClient.isSupported();
+      $("disconnect").disabled = !connected;
+      $("read").disabled = !connected;
+      $("led").disabled = $("color").disabled = !connected || !capabilities?.hasFeature(DeviceFeature.Led);
+      $("haptic").disabled = !connected || !capabilities?.hasFeature(DeviceFeature.Haptic);
+      $("imu").disabled = !connected || !capabilities?.hasFeature(DeviceFeature.Imu);
+      $("imu").textContent = streaming ? "Stop IMU stream" : "Start IMU stream";
+    }
+    function report(error) { $("status").textContent = `${error.name ?? "Error"}: ${error.message ?? error}`; }
+    async function action(callback) {
+      try { await callback(); } catch (error) { report(error); }
+    }
+
+    controls(false);
+    $("status").textContent = SenswearClient.isSupported()
+      ? "Ready. Click Connect to choose your device."
+      : "Web Bluetooth is unavailable here. Use a supported browser on HTTPS or localhost.";
+
+    $("connect").addEventListener("click", () => action(async () => {
+      $("connect").disabled = true;
+      capabilities = null;
+      streaming = false;
+      samples = 0;
+      for (const key of Object.keys(state)) delete state[key];
+      client = new SenswearClient(null, {
+        onNotificationError: report,
+        onDisconnected() {
+          streaming = false;
+          controls(false);
+          $("status").textContent = "Device disconnected. Click Connect to select it again.";
+        },
+      });
+      try {
+        // Reaches the chooser during this click, without any preceding asynchronous work.
+        await client.connect();
+        state.device = { id: client.deviceId, name: client.device?.name };
+        try {
+          const info = await client.deviceInfo.read();
+          capabilities = info.capabilities;
+          state.firmware = info.firmwareVersion;
+          state.shields = capabilities.shields;
+          state.featureMask = capabilities.featureMask;
+        } catch (error) {
+          state.metadataError = error.message; // Older firmware may omit these services.
+        }
+        state.batteryPercent = (await client.battery.read()).percent;
+        await client.battery.subscribe((level) => { state.batteryPercent = level.percent; render(); });
+        controls(true);
+        $("status").textContent = "Connected. Controls reflect the firmware's advertised capabilities.";
+        render();
+      } catch (error) {
+        await client.destroy();
+        client = null;
+        controls(false);
+        throw error;
+      }
+    }));
+
+    $("disconnect").addEventListener("click", () => action(async () => {
+      await client?.destroy();
+      client = null;
+      streaming = false;
+      controls(false);
+      $("status").textContent = "Disconnected.";
+    }));
+    $("read").addEventListener("click", () => action(async () => {
+      state.batteryPercent = (await client.battery.read()).percent;
+      render();
+    }));
+    $("led").addEventListener("click", () => action(() => client.led.set($("color").value)));
+    $("haptic").addEventListener("click", () => action(() => client.haptic.vibrate(150, 200)));
+    $("imu").addEventListener("click", () => action(async () => {
+      $("imu").disabled = true;
+      try {
+        if (streaming) {
+          await client.imu.unsubscribe(IMU_ACCELEROMETER_UUID);
+          await client.imu.setEnabled(false);
+          streaming = false;
+        } else {
+          await client.imu.setEnabled(true);
+          await client.imu.setDrainPeriodMs(100);
+          await client.imu.subscribeAccelerometer((sample) => {
+            state.acceleration = { timestampUs: sample.timestampUs, xG: sample.xG, yG: sample.yG, zG: sample.zG };
+            state.samples = ++samples;
+            // Throttle rendering only; every sample reaches the callback.
+            if (performance.now() - lastRender >= 100) { lastRender = performance.now(); render(); }
+          });
+          streaming = true;
+        }
+      } finally {
+        controls(await client.isConnected());
+      }
+    }));
+    window.addEventListener("pagehide", () => { void client?.destroy(); });
+  </script>
+</body>
+</html>
